@@ -1,0 +1,15 @@
+torch
+timm>=1.0.20
+transformers>=4.51,<5
+accelerate
+albumentations
+opencv-python-headless<5
+pydicom
+pylibjpeg
+pylibjpeg-libjpeg
+pandas
+numpy
+scikit-learn
+tqdm
+psutil
+torch-ema

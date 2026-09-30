@@ -1,0 +1,15 @@
+data/*
+!data/.gitkeep
+
+model/*
+!model/.gitkeep
+
+*.pth
+*.pt
+*.pkl
+*.npy
+*.npz
+submission.csv
+
+__pycache__/
+.DS_Store
