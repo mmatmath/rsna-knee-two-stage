@@ -1,5 +1,7 @@
 import glob
+import hashlib
 import os
+from zipfile import BadZipFile
 
 import cv2
 import numpy as np
@@ -12,6 +14,7 @@ from tqdm import tqdm
 
 N_SLICES = 24
 IMG_SIZE = 224
+CACHE_VERSION = 1
 
 slot_mapping = {
     ("Sagittal", 0): 0,
@@ -98,10 +101,39 @@ def choose_series(df_study, dicom_path):
     return selected
 
 
+def source_stamp(selected):
+    """Track the chosen DICOM files without reading their pixel data."""
+    digest = hashlib.sha256()
+    for slot, (_, series, files) in sorted(selected.items()):
+        digest.update(f"{slot}:{series}\n".encode())
+        for path in files:
+            stat = os.stat(path)
+            digest.update(f"{path}:{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
 def process_study(args):
     study, records, config = args
     df_study = pd.DataFrame(records)
     selected = choose_series(df_study, config.dicom_path)
+    stamp = source_stamp(selected)
+    cache_path = os.path.join(config.output_path, str(study) + ".npz")
+    if os.path.exists(cache_path):
+        try:
+            with np.load(cache_path) as data:
+                valid = (int(data["cache_version"]) == CACHE_VERSION
+                         and str(data["source_stamp"]) == stamp
+                         and data["slot_mask"].shape == (6,)
+                         and "images" in data.files)
+                if valid:
+                    slot_mask = data["slot_mask"]
+                    meta = {"StudyInstanceUID": study}
+                    for slot in range(6):
+                        meta[f"slot_{slot}_series"] = selected[slot][1] if slot_mask[slot] else ""
+                    return meta, True
+        except (OSError, ValueError, KeyError, BadZipFile):
+            pass
+
     images = np.zeros((6, N_SLICES, IMG_SIZE, IMG_SIZE), dtype=np.uint8)
     slot_mask = np.zeros(6, dtype=np.uint8)
     meta = {"StudyInstanceUID": study}
@@ -119,11 +151,13 @@ def process_study(args):
         meta[f"slot_{slot}_series"] = series
 
     if not slot_mask.any():
-        return None
+        return None, False
     os.makedirs(config.output_path, exist_ok=True)
-    np.savez_compressed(os.path.join(config.output_path, str(study) + ".npz"),
-                        images=images, slot_mask=slot_mask)
-    return meta
+    temp_path = cache_path + ".tmp.npz"
+    np.savez_compressed(temp_path, images=images, slot_mask=slot_mask,
+                        cache_version=CACHE_VERSION, source_stamp=stamp)
+    os.replace(temp_path, cache_path)
+    return meta, False
 
 
 def main():
@@ -131,15 +165,18 @@ def main():
     df = pd.read_csv(config.series_csv)
     jobs = [(study, group.to_dict("records"), config) for study, group in df.groupby("StudyInstanceUID", sort=True)]
     rows = []
+    reused = 0
     with Pool(processes=config.n_processes) as pool:
-        for result in tqdm(pool.imap(process_study, jobs), total=len(jobs)):
-            if result is not None:
-                rows.append(result)
+        for row, cached in tqdm(pool.imap(process_study, jobs), total=len(jobs)):
+            if row is not None:
+                rows.append(row)
+                reused += cached
     if not rows:
         raise ValueError("No usable studies; check the train_series DICOM directory and pixel decoders")
     df_meta = pd.DataFrame(rows).sort_values("StudyInstanceUID")
     df_meta.to_csv(config.meta_path, index=False)
     print("Usable studies:", len(df_meta), "of", len(jobs))
+    print("Reused study caches:", reused)
     print("Slot coverage:", df_meta[[f"slot_{i}_series" for i in range(6)]].notna().sum().to_dict())
     df_slots = df.dropna(subset=["Fluid_Sensitive"]).copy()
     df_slots["slot"] = [slot_mapping.get((str(plane).strip().capitalize(), int(fluid)))

@@ -66,7 +66,7 @@ Edit `Configuration.fold` in the scripts to train another fold. With five folds,
 
 2. `preprocess_data.py`
 
-   Selects one representative series for each plane/fluid-sensitive slot, sorts slices along the DICOM slice normal, robustly normalizes each MRI series, and stores a compact `[6, 24, 224, 224]` uint8 cache. Missing slots are zero-filled and recorded in `slot_mask`. Raw uncompressed cache size is at most about 7.2 MB per study; the NPZ is compressed.
+   Selects one representative series for each plane/fluid-sensitive slot, sorts slices along the DICOM slice normal, robustly normalizes each MRI series, and stores a compact `[6, 24, 224, 224]` uint8 cache. Missing slots are zero-filled and recorded in `slot_mask`. Raw uncompressed cache size is at most about 7.2 MB per study; the NPZ is compressed. Reruns reuse each study cache when the chosen DICOM files are unchanged (names, sizes, and modification times).
 
 3. `create_folds.py`
 
@@ -78,7 +78,7 @@ Edit `Configuration.fold` in the scripts to train another fold. With five folds,
 
 5. `extract_features.py`
 
-   Loads `best_stage1.pth`, builds every step-1 and step-2 2.5D window, and stores float16 ConvNeXt embeddings in `features_dict.pkl` with matching `slot_dict.pkl`. Step distances are positions in the 24-slice cache, not guaranteed adjacent original DICOM slices; boundary indices clamp instead of wrapping.
+   Loads `best_stage1.pth`, builds every step-1 and step-2 2.5D window, and stores float16 ConvNeXt embeddings in `features_dict.pkl` with matching `slot_dict.pkl`. Per-study files in `feature_cache/` make interrupted runs resumable; a study is recomputed if the size or modification time of its preprocessed NPZ or the Stage 1 checkpoint changes. Step distances are positions in the 24-slice cache, not guaranteed adjacent original DICOM slices; boundary indices clamp instead of wrapping.
 
 6. `train_stage2.py` / `eval_stage2.py`
 
@@ -105,11 +105,14 @@ model/<encoder>/fold-0/
 ├── log_stage1.txt
 ├── features_dict.pkl
 ├── slot_dict.pkl
+├── feature_cache/          # resumable per-study embeddings
 ├── config_stage2.pkl
 ├── best_stage2.pth
 ├── weights_inference.pth
 └── log_stage2.txt
 ```
+
+The generated caches stay under ignored `data/` and `model/` paths. If preprocessing or feature-extraction code changes in a way that affects results, increment the corresponding `CACHE_VERSION` in that script (or remove its generated cache files).
 
 ## Possible next experiment
 
