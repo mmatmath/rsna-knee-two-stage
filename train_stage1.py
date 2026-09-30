@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 
 import pandas as pd
 import torch
@@ -34,7 +35,7 @@ class Configuration:
     groups_per_slot: int = 2
     steps: tuple = (1, 2)
     epochs: int = 15
-    batch_size: int = 4
+    batch_size: int = 1
     lr: float = 3e-5
     focal: bool = True
     gamma: float = 2.0
@@ -44,7 +45,7 @@ class Configuration:
     warmup_epochs: float = 0.0
     scheduler: str = "cosine"
     gradient_clipping: bool = True
-    gc: bool = False
+    gc: bool = True
     seed: int = 42
     num_workers: int = 0 if os.name == "nt" else 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,11 +55,11 @@ class Configuration:
 
 def evaluate(model, loader, df_valid, config):
     predictions, targets = predict(model, loader, config.device)
-    print("\nWeak/known validation AUC")
+    print("\nStage 1 inner-fold selection AUC (known targets)")
     mean, _, _ = multilabel_auc(targets, predictions, classes)
     gold = df_valid.label_source.to_numpy() == "gold"
     if gold.any():
-        print("\nGold-only validation AUC")
+        print("\nGold-only diagnostic AUC")
         gold_mean, _, _ = multilabel_auc(targets[gold], predictions[gold], classes)
         print("Gold Mean            {:.4f}".format(gold_mean))
     return mean
@@ -74,8 +75,17 @@ def main():
     # Data                                                                                                             #
     #------------------------------------------------------------------------------------------------------------------#
     df = pd.read_csv("./data/train_5_folds.csv")
-    df_train = df[df.fold != config.fold].reset_index(drop=True)
-    df_valid = df[df.fold == config.fold].reset_index(drop=True)
+    inner_fold = (config.fold + 1) % 5
+    print(f"Outer evaluation fold: {config.fold}; Stage 1 selection fold: {inner_fold}")
+    df_train = df[~df.fold.isin([config.fold, inner_fold])].reset_index(drop=True)
+    df_valid = df[df.fold == inner_fold].reset_index(drop=True)
+    if set(df_train.StudyInstanceUID) & set(df_valid.StudyInstanceUID):
+        raise ValueError("Stage 1 train and selection studies overlap")
+    if set(df_train.StudyInstanceUID) & set(df[df.fold == config.fold].StudyInstanceUID):
+        raise ValueError("Outer evaluation study entered Stage 1 training")
+    with open(os.path.join(model_path, "stage1_split.json"), "w") as file:
+        json.dump({"outer_fold": config.fold, "selection_fold": inner_fold,
+                   "train_folds": sorted(df_train.fold.unique().tolist())}, file)
     train_dataset = TrainDataset(df_train, classes, config.data_path, config.groups_per_slot, config.steps, True)
     valid_dataset = TrainDataset(df_valid, classes, config.data_path, config.groups_per_slot, config.steps, False)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -103,11 +113,11 @@ def main():
         if ema is not None:
             with ema.average_parameters():
                 score = evaluate(model, valid_loader, df_valid, config)
-                if score > best_score:
+                if score > best_score or epoch == 0:
                     torch.save(model.state_dict(), os.path.join(model_path, "best_stage1.pth"))
         else:
             score = evaluate(model, valid_loader, df_valid, config)
-            if score > best_score:
+            if score > best_score or epoch == 0:
                 torch.save(model.state_dict(), os.path.join(model_path, "best_stage1.pth"))
         best_score = max(best_score, score)
         print("Best Mean            {:.4f}".format(best_score))

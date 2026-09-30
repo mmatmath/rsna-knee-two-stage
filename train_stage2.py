@@ -1,6 +1,7 @@
 import os
 import pickle
 import sys
+import json
 
 import numpy as np
 import pandas as pd
@@ -38,7 +39,6 @@ class Configuration:
     epochs: int = 12
     batch_size: int = 32
     lr: float = 1e-5
-    hidden_size: int = 1024
     intermediate_size: int = 1024
     num_hidden_layers: int = 3
     attention_heads: int = 8
@@ -49,7 +49,7 @@ class Configuration:
     gamma: float = 2.0
     use_ema: bool = True
     ema_decay: float = 0.999
-    pool: str = "gem"
+    pool: str = "mean"
     warmup_epochs: float = 0.0
     scheduler: str = "constant"
     gradient_clipping: bool = True
@@ -72,15 +72,15 @@ def make_loader(df, features, slots, config, train_mode, step=(1, 2)):
 def evaluate(model, loader1, loader2, df_valid, config):
     pred1, targets = predict(model, loader1, config.device)
     pred2, _ = predict(model, loader2, config.device)
-    print("\nStep 1")
+    print("\nStep 1 weak-label CV AUC (known targets)")
     score1, _, _ = multilabel_auc(targets, pred1, classes)
-    print("\nStep 2")
-    score2, _, _ = multilabel_auc(targets, pred2, classes)
+    print("\nStep 2 weak-label CV AUC (known targets)")
+    multilabel_auc(targets, pred2, classes)
     gold = df_valid.label_source.to_numpy() == "gold"
     if gold.any():
-        print("\nGold-only validation AUC")
+        print("\nGold-only diagnostic AUC")
         multilabel_auc(targets[gold], pred1[gold], classes)
-    return float(np.nanmean([score1, score2]))
+    return score1  # Inference uses step 1; step 2 is a diagnostic augmentation.
 
 
 def save_inference_weights(stage2, config, model_path):
@@ -104,6 +104,11 @@ def main():
     setup_system(config.seed)
     model_path = make_model_path(config.model_path, config.model, config.fold)
     sys.stdout = Logger(os.path.join(model_path, "log_stage2.txt"))
+    with open(os.path.join(model_path, "stage1_split.json")) as file:
+        split = json.load(file)
+    if (split["outer_fold"] != config.fold or config.fold in split["train_folds"]
+            or config.fold == split["selection_fold"]):
+        raise ValueError("Stage 1 checkpoint used the outer evaluation fold")
     #------------------------------------------------------------------------------------------------------------------#
     # Data                                                                                                             #
     #------------------------------------------------------------------------------------------------------------------#
@@ -112,8 +117,7 @@ def main():
     with open(os.path.join(model_path, "slot_dict.pkl"), "rb") as file:
         slots = pickle.load(file)
     feature_dim = int(np.asarray(next(iter(features[0].values()))).shape[-1])
-    if feature_dim != config.hidden_size:
-        raise ValueError(f"ConvNeXt features have D={feature_dim}; set hidden_size={feature_dim}")
+    print("ConvNeXt feature dimension:", feature_dim)
 
     df = pd.read_csv("./data/train_5_folds.csv")
     df_train = df[df.fold != config.fold].reset_index(drop=True)
@@ -126,7 +130,7 @@ def main():
     # Model                                                                                                            #
     #------------------------------------------------------------------------------------------------------------------#
     model = Stage2(
-        config.transformer, config.hidden_size, config.intermediate_size,
+        config.transformer, feature_dim, config.intermediate_size,
         config.attention_heads, config.num_hidden_layers, config.attention_dropout,
         config.hidden_dropout, config.classifier_dropout, gc=config.gc, pool=config.pool,
     ).to(config.device)
@@ -149,11 +153,11 @@ def main():
         if ema is not None:
             with ema.average_parameters():
                 score = evaluate(model, valid_loader1, valid_loader2, df_valid, config)
-                if score > best_score:
+                if score > best_score or epoch == 0:
                     torch.save(model.state_dict(), os.path.join(model_path, "best_stage2.pth"))
         else:
             score = evaluate(model, valid_loader1, valid_loader2, df_valid, config)
-            if score > best_score:
+            if score > best_score or epoch == 0:
                 torch.save(model.state_dict(), os.path.join(model_path, "best_stage2.pth"))
         best_score = max(best_score, score)
         print("Best Mean            {:.4f}".format(best_score))

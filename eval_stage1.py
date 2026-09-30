@@ -43,11 +43,12 @@ def main():
     model.load_state_dict(torch.load(os.path.join(model_path, "best_stage1.pth"), map_location="cpu"))
     model = model.to(config.device)
     predictions, targets = predict(model, loader, config.device)
+    print("Weak-label CV AUC (known targets)")
     multilabel_auc(targets, predictions, classes)
 
     gold = df.label_source.to_numpy() == "gold"
     if gold.any():
-        print("\nGold-only validation AUC")
+        print("\nGold-only diagnostic AUC")
         multilabel_auc(targets[gold], predictions[gold], classes)
     if config.dump_predictions:
         output = df[["StudyInstanceUID", "label_source"]].copy()

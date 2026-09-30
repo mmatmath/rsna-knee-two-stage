@@ -26,7 +26,7 @@ class Configuration:
     cut: int = 96
     batch_size: int = 32
     classifier_dropout: float = 0.15
-    pool: str = "gem"
+    pool: str = "mean"
     num_workers: int = 0 if os.name == "nt" else 4
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -55,6 +55,7 @@ def main():
         num_hidden_layers=transformer_config.num_hidden_layers,
         classifier_dropout=config.classifier_dropout,
         pool=config.pool,
+        transformer_config=transformer_config,
     )
     model.load_state_dict(torch.load(os.path.join(model_path, "best_stage2.pth"), map_location="cpu"))
     model = model.to(config.device)
@@ -62,10 +63,14 @@ def main():
     df = df[df.fold == config.fold].reset_index(drop=True)
     pred1, targets = predict(model, loader_for(df, features, slots, config, 1), config.device)
     pred2, _ = predict(model, loader_for(df, features, slots, config, 2), config.device)
-    print("Step 1")
+    print("Step 1 weak-label CV AUC (known targets)")
     multilabel_auc(targets, pred1, classes)
-    print("\nStep 2")
+    print("\nStep 2 weak-label CV AUC (known targets)")
     multilabel_auc(targets, pred2, classes)
+    gold = df.label_source.to_numpy() == "gold"
+    if gold.any():
+        print("\nGold-only diagnostic AUC (step 1)")
+        multilabel_auc(targets[gold], pred1[gold], classes)
 
 
 if __name__ == "__main__":

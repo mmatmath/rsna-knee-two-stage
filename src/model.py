@@ -59,6 +59,8 @@ class Stage1(nn.Module):
         self.out_bias = nn.Parameter(torch.zeros(n_classes))
 
     def forward(self, images, token_mask, slot_ids):
+        if not torch.all(token_mask.any(dim=1)):
+            raise ValueError("Stage 1 received a study without any MRI tokens")
         batch, tokens, channels, height, width = images.shape
         # [B, T, 3, H, W] -> [B*T, 3, H, W]
         x = images.reshape(batch * tokens, channels, height, width)
@@ -79,9 +81,10 @@ class Stage2(nn.Module):
     def __init__(self, transformer_name="microsoft/deberta-v3-base", hidden_size=1024,
                  intermediate_size=1024, attention_heads=8, num_hidden_layers=3,
                  attention_dropout=0.05, hidden_dropout=0.15,
-                 classifier_dropout=0.15, n_classes=12, n_slots=6, gc=False, pool="gem"):
+                 classifier_dropout=0.15, n_classes=12, n_slots=6, gc=False, pool="mean",
+                 transformer_config=None):
         super().__init__()
-        config = transformers.AutoConfig.from_pretrained(transformer_name)
+        config = transformer_config or transformers.AutoConfig.from_pretrained(transformer_name)
         config.hidden_size = hidden_size
         config.intermediate_size = intermediate_size
         config.vocab_size = 3
@@ -123,11 +126,13 @@ class Stage2(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, encoder_name, transformer_config, classifier_dropout=0.15,
-                 n_classes=12, n_slots=6, pool="gem"):
+                 n_classes=12, n_slots=6, pool="mean"):
         super().__init__()
         self.image_encoder = timm.create_model(encoder_name, pretrained=False, num_classes=0)
         self.transformer = DebertaV2Model(transformer_config)
         hidden_size = transformer_config.hidden_size
+        if self.image_encoder.num_features != hidden_size:
+            raise ValueError("Encoder feature dimension and Transformer hidden size differ")
         self.slot_embedding = nn.Embedding(n_slots, hidden_size)
         self.cls_embedding = nn.Parameter(hidden_size ** -0.5 * torch.randn(1, 1, hidden_size))
         self.pool = get_pooling(pool)
@@ -150,5 +155,7 @@ class Model(nn.Module):
         return self.fc(x)
 
     def forward(self, images, slot_ids, attention_mask):
-        features = self.forward_encoder(images)
+        batch, tokens = images.shape[:2]
+        features = self.forward_encoder(images.reshape(batch * tokens, *images.shape[2:]))
+        features = features.reshape(batch, tokens, -1)
         return self.forward_transformer(features, slot_ids, attention_mask)

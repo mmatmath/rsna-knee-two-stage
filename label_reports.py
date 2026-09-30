@@ -35,18 +35,18 @@ For every key use 1 when the finding is explicitly present, 0 when it is explici
 and null when it is uncertain, borderline, or not mentioned. Never invent an unreported finding.
 
 Definitions:
-ACL: high-grade partial or complete ACL tear or rupture.
-MCL: high-grade acute partial or complete MCL tear.
-Medial Meniscus: tear involving the medial meniscus.
-Lateral Meniscus: tear involving the lateral meniscus.
-Medial OA: definite medial tibiofemoral osteoarthritis with cartilage loss.
-Lateral OA: definite lateral tibiofemoral osteoarthritis with cartilage loss.
-PF OA: definite patellofemoral osteoarthritis with cartilage loss.
+ACL: high-grade partial (>50% fibers) or complete tear; mild signal or degeneration alone is not positive.
+MCL: high-grade acute partial or complete tear; low-grade sprain or chronic change is not positive.
+Medial Meniscus: definite medial tear reaching a surface or displaced/truncated fragment; intrasubstance degeneration is not positive.
+Lateral Meniscus: same definite tear criteria for the lateral meniscus.
+Medial OA: moderate/large area (~1 cm) of >50% cartilage loss in the medial compartment.
+Lateral OA: same high-grade cartilage loss criterion in the lateral compartment.
+PF OA: same high-grade cartilage loss criterion in the patellofemoral compartment.
 Effusion: moderate or large knee joint effusion.
 Synovitis: definite synovitis or synovial proliferation.
-Baker's: Baker or popliteal cyst.
-Contusion: acute bone contusion or traumatic marrow edema.
-Fracture: acute fracture of the imaged knee.
+Baker's: moderate or large Baker/popliteal cyst; tiny cyst is not positive.
+Contusion: traumatic marrow edema from impact without a fracture line; degenerative edema is not positive.
+Fracture: acute cortical break or fracture line; chronic healed fracture is not positive.
 
 The JSON keys must be exactly: ACL, MCL, Medial Meniscus, Lateral Meniscus, Medial OA,
 Lateral OA, PF OA, Effusion, Synovitis, Baker's, Contusion, Fracture."""
@@ -61,7 +61,10 @@ def parse_json(text):
         result = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
-    return {name: result.get(name) if result.get(name) in (0, 1, None) else None for name in classes}
+    if not isinstance(result, dict):
+        return None
+    return {name: result.get(name) if type(result.get(name)) is int and result[name] in (0, 1) else None
+            for name in classes}
 
 
 def generate_labels(model, tokenizer, reports, config):
@@ -81,6 +84,7 @@ def generate_labels(model, tokenizer, reports, config):
             **inputs,
             max_new_tokens=config.max_new_tokens,
             do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
         )
     generated = output[:, inputs["input_ids"].shape[1]:]
     return [parse_json(text) for text in tokenizer.batch_decode(generated, skip_special_tokens=True)]
@@ -96,6 +100,8 @@ def validate(df):
         rows.append({
             "target": name,
             "coverage": known.mean(),
+            "gold_positive_rate": y_true.mean() if known.any() else np.nan,
+            "extracted_positive_rate": y_pred.mean() if known.any() else np.nan,
             "accuracy": accuracy_score(y_true, y_pred) if known.any() else np.nan,
             "f1": f1_score(y_true, y_pred, zero_division=0) if known.any() else np.nan,
             "roc_auc": auc,
@@ -105,6 +111,8 @@ def validate(df):
 
 def main():
     config = Configuration()
+    if config.mode not in ("validate", "full"):
+        raise ValueError("mode must be 'validate' or 'full'")
     df = pd.read_csv(config.input_path)
     if config.mode == "validate":
         gold = df[classes].notna().all(axis=1)
@@ -119,6 +127,13 @@ def main():
         previous = pd.read_csv(output_path)
         done = set(previous.StudyInstanceUID.astype(str))
     df = df.loc[~df.StudyInstanceUID.astype(str).isin(done)].reset_index(drop=True)
+
+    if df.empty:
+        print("All requested reports are already processed:", output_path)
+        if config.mode == "validate":
+            renamed = previous.rename(columns={name: name + "_qwen" for name in classes})
+            validate(pd.read_csv(config.input_path).merge(renamed, on="StudyInstanceUID"))
+        return
 
     tokenizer = AutoTokenizer.from_pretrained(config.model)
     tokenizer.padding_side = "left"

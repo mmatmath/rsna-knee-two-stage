@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.utils import normalize_images
+
 
 def get_augmentation(train=True):
     if not train:
@@ -34,9 +36,11 @@ class TrainDataset(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
         path = os.path.join(self.data_path, str(row.StudyInstanceUID) + ".npz")
-        data = np.load(path)
-        images = data["images"]       # [6, 9, H, W]
-        slot_mask = data["slot_mask"] # [6]
+        with np.load(path) as data:
+            images = data["images"]       # [6, 24, H, W]
+            slot_mask = data["slot_mask"] # [6]
+        if not slot_mask.any():
+            raise ValueError(f"No usable MRI slot for study {row.StudyInstanceUID}")
 
         windows = []
         token_mask = []
@@ -48,7 +52,11 @@ class TrainDataset(Dataset):
                     step = int(np.random.choice(self.steps)) if self.train else self.steps[group % len(self.steps)]
                     low = step
                     high = images.shape[1] - step
-                    center = np.random.randint(low, high) if self.train else int(np.linspace(low, high - 1, self.groups_per_slot)[group])
+                    if self.train:
+                        center = np.random.randint(low, high)
+                    else:
+                        fraction = (group + 1) / (self.groups_per_slot + 1)
+                        center = int(round(low + fraction * (high - low - 1)))
                     window = images[slot, [center - step, center, center + step]]
                     token_mask.append(1)
                 else:
@@ -61,12 +69,11 @@ class TrainDataset(Dataset):
                 windows.append(window)
                 slot_ids.append(slot)
 
-        images = np.stack(windows).astype(np.float32) / 255.0
-        images = (images - 0.5) / 0.5
+        images = normalize_images(torch.from_numpy(np.stack(windows)))
         targets = row[self.classes].to_numpy(dtype=np.float32)
 
         return (
-            torch.from_numpy(images),
+            images,
             torch.tensor(token_mask, dtype=torch.long),
             torch.tensor(slot_ids, dtype=torch.long),
             torch.from_numpy(targets),

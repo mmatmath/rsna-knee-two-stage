@@ -1,5 +1,6 @@
 import os
 import pickle
+import json
 
 import numpy as np
 import pandas as pd
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 
 from src.model import Stage1
+from src.utils import make_windows, normalize_images
 
 
 classes = [
@@ -25,25 +27,11 @@ class Configuration:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def make_windows(images, slot_mask, step):
-    windows = []
-    slot_ids = []
-    for slot in range(6):
-        if not slot_mask[slot]:
-            continue
-        for center in range(images.shape[1]):
-            indices = np.clip([center - step, center, center + step], 0, images.shape[1] - 1)
-            windows.append(images[slot, indices])
-            slot_ids.append(slot)
-    return np.stack(windows), np.asarray(slot_ids, dtype=np.int64)
-
-
 @torch.no_grad()
 def encode(model, windows, config):
     features = []
     for start in range(0, len(windows), config.batch_size):
-        images = torch.from_numpy(windows[start:start + config.batch_size]).float() / 255.0
-        images = ((images - 0.5) / 0.5).to(config.device)
+        images = normalize_images(torch.from_numpy(windows[start:start + config.batch_size]).to(config.device))
         features.append(model.image_encoder(images).cpu().numpy())
     return np.concatenate(features).astype(np.float16)
 
@@ -51,6 +39,11 @@ def encode(model, windows, config):
 def main():
     config = Configuration()
     model_path = f"./model/{config.model}/fold-{config.fold}"
+    with open(os.path.join(model_path, "stage1_split.json")) as file:
+        split = json.load(file)
+    if (split["outer_fold"] != config.fold or config.fold in split["train_folds"]
+            or config.fold == split["selection_fold"]):
+        raise ValueError("Stage 1 checkpoint used the outer evaluation fold")
     model = Stage1(config.model, pretrained=False)
     model.load_state_dict(torch.load(os.path.join(model_path, "best_stage1.pth"), map_location="cpu"))
     model = model.to(config.device).eval()
@@ -59,9 +52,11 @@ def main():
     features_dict_list = [dict(), dict()]
     slot_dict_list = [dict(), dict()]
     for study in tqdm(df.StudyInstanceUID.astype(str)):
-        data = np.load(f"./data/npy_study/{study}.npz")
+        with np.load(f"./data/npy_study/{study}.npz") as data:
+            images = data["images"]
+            slot_mask = data["slot_mask"]
         for step in (1, 2):
-            windows, slot_ids = make_windows(data["images"], data["slot_mask"], step)
+            windows, slot_ids = make_windows(images, slot_mask, step)
             features_dict_list[step - 1][study] = encode(model, windows, config)
             slot_dict_list[step - 1][study] = slot_ids
 

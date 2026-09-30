@@ -2,6 +2,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.utils import cut_features
+
 
 class TrainDataset(Dataset):
     def __init__(self, studies, features, slots, labels, cut=96, step=(1, 2), train=False):
@@ -26,10 +28,7 @@ class TrainDataset(Dataset):
         features = np.asarray(self.features[step_index][study], dtype=np.float32)
         slot_ids = np.asarray(self.slots[step_index][study], dtype=np.int64)
 
-        if len(features) > self.cut:
-            indices = np.linspace(0, len(features) - 1, self.cut).round().astype(int)
-            features = features[indices]
-            slot_ids = slot_ids[indices]
+        features, slot_ids = cut_features(features, slot_ids, self.cut)
 
         return (
             torch.from_numpy(features),

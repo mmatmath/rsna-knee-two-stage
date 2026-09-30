@@ -10,6 +10,7 @@ from tqdm import tqdm
 from preprocess_data import IMG_SIZE, N_SLICES, choose_series, load_series, sample_series
 from src.metric import multilabel_auc
 from src.model import Model
+from src.utils import cut_features, make_windows, normalize_images
 
 
 classes = [
@@ -24,10 +25,11 @@ class Configuration:
     model: str = "convnext_base.dinov3_lvd1689m"
     fold: int = 0
     step: int = 1
+    cut: int = 96
     batch_size: int = 64
     classifier_dropout: float = 0.15
-    pool: str = "gem"
-    dicom_path: str = "./data/train_images"
+    pool: str = "mean"
+    dicom_path: str = "./data/train_series"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -43,32 +45,16 @@ def load_study(df_study, config):
     return images, slot_mask
 
 
-def make_windows(images, slot_mask, step):
-    windows = []
-    slot_ids = []
-    for slot in range(6):
-        if not slot_mask[slot]:
-            continue
-        for center in range(images.shape[1]):
-            index = np.clip([center - step, center, center + step], 0, images.shape[1] - 1)
-            windows.append(images[slot, index])
-            slot_ids.append(slot)
-    if not windows:
-        windows.append(np.zeros((3, IMG_SIZE, IMG_SIZE), dtype=np.uint8))
-        slot_ids.append(0)
-    return np.stack(windows), np.asarray(slot_ids, dtype=np.int64)
-
-
 @torch.no_grad()
 def predict_study(model, images, slot_mask, config):
     windows, slot_ids = make_windows(images, slot_mask, config.step)
     features = []
     for start in range(0, len(windows), config.batch_size):
-        x = torch.from_numpy(windows[start:start + config.batch_size]).float() / 255.0
-        x = ((x - 0.5) / 0.5).to(config.device)
+        x = normalize_images(torch.from_numpy(windows[start:start + config.batch_size]).to(config.device))
         features.append(model.forward_encoder(x))
-    features = torch.cat(features).unsqueeze(0)
-    slot_ids = torch.from_numpy(slot_ids).unsqueeze(0).to(config.device)
+    features, slot_ids = cut_features(torch.cat(features), torch.from_numpy(slot_ids).to(config.device), config.cut)
+    features = features.unsqueeze(0)
+    slot_ids = slot_ids.unsqueeze(0)
     attention_mask = torch.ones_like(slot_ids)
     return torch.sigmoid(model.forward_transformer(features, slot_ids, attention_mask))[0].cpu().numpy()
 
@@ -91,7 +77,12 @@ def main():
         images, slot_mask = load_study(rows, config)
         predictions.append(predict_study(model, images, slot_mask, config))
     predictions = np.stack(predictions)
+    print("Weak-label CV AUC (known targets)")
     multilabel_auc(df[classes].values, predictions, classes)
+    gold = df.label_source.to_numpy() == "gold"
+    if gold.any():
+        print("\nGold-only diagnostic AUC")
+        multilabel_auc(df.loc[gold, classes].values, predictions[gold], classes)
 
     output = df[["StudyInstanceUID", "label_source"]].copy()
     for i, name in enumerate(classes):
